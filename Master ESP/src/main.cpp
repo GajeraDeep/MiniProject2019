@@ -17,23 +17,27 @@ ESP8266WebServer server(80);
 
 String waterMeasures = "";
 long lastPushTime = 0;
-int moistureToMaintain = 0;
+int requiredMoisture = 0;
 
 String sensorToValveMap[3][2] = {
     {"sensor1", "v1"},
     {"sensor2", "v2"},
     {"sensor3", "v3"}};
 
-int valveStatus[3];
-int prevValveStatus[3];
+int valveStatus[3] = {0,0,0};
+int prevValveStatus[3] = {0,0,0};
 
 int sensorMeasures[3];
+bool sensorMoistureChanged = false;
 
-struct Sensor
-{
-    String id;
-    short measure;
-} s;
+int pumpState = 0;
+int prevPumpState = 0; // pump state before last push 
+
+// struct Sensor
+// {
+//     String id;
+//     short measure;
+// } s;
 
 void setupAccessPoint();
 void setupServer();
@@ -44,14 +48,17 @@ void pushMeasures();
 bool isPushRequired();
 bool getNextMeasure();
 short getShort(String s);
-void resetMoistureToMaintain();
+void resetRequiredMoisture();
+void resetPumpState();
+
 
 void setup()
 {
     Serial.begin(9600);
+    pinMode(LED_BUILTIN, OUTPUT);
     WiFi.mode(WIFI_AP_STA);
     lastPushTime = millis();
-    resetMoistureToMaintain();
+    resetRequiredMoisture();
 }
 
 void setupAccessPoint()
@@ -114,27 +121,48 @@ int getIndexForID(String sid)
 
 void handleRequest()
 {
+    digitalWrite(LED_BUILTIN, LOW);
+
     int index = getIndexForID(server.arg("id"));
     if (index == -1)
     {
-        server.send(200, "text/http", "Invalid server id");
+        server.send(200, "text/http", "Invalid sensor id");
         return;
     }
 
     short m = getShort(server.arg("m"));
-    if (m < moistureToMaintain - 5 && valveStatus[index] == 0)
-    {
-        Serial.print("Set valve " + sensorToValveMap[index][1] + " to on");
-        valveStatus[index] = 1;
-    }
-    else if (valveStatus[index] == 1 && m >= moistureToMaintain + 5)
-    {
-        Serial.print("Set valve " + sensorToValveMap[index][1] + " to off");
-        valveStatus[index] = 0;
+    if (m != sensorMeasures[index]) {
+        if (m < requiredMoisture - 5 && valveStatus[index] == 0)
+        {
+            Serial.println("Set valve " + sensorToValveMap[index][1] + " to on");
+            valveStatus[index] = 1;
+        }
+        else if (valveStatus[index] == 1 && m >= requiredMoisture + 5)
+        {
+            Serial.println("Set valve " + sensorToValveMap[index][1] + " to off");
+            valveStatus[index] = 0;
+        }
+        sensorMoistureChanged = true;
     }
 
-    waterMeasures += server.arg("id") + ":" + server.arg("m") + ",";
-    server.send(200, "text/http", "recorder");
+    sensorMeasures[index] = getShort(server.arg("m"));
+    resetPumpState();
+
+    //waterMeasures += server.arg("id") + ":" + server.arg("m") + ",";
+    server.send(200, "text/http", "recorded");
+
+    digitalWrite(LED_BUILTIN, HIGH);
+}
+
+void resetPumpState() {
+    for (int i = 0; i < 3; i++)
+    {
+        if(valveStatus[i] == 1) {
+            pumpState = 1;
+            return;
+        }
+    }
+    pumpState = 0;
 }
 
 void pushMeasures()
@@ -142,27 +170,59 @@ void pushMeasures()
     beginFirebase();
     setupStationMode();
 
-    while (getNextMeasure())
-    {
-        int valveIndex = getIndexForID(s.id);
+    // while (getNextMeasure())
+    // {
+    //     int valveIndex = getIndexForID(s.id);
         
-        String path = "/valves/" + sensorToValveMap[valveIndex][1] + "/moisture_measures/" + s.id;
-        Firebase.setInt(C_PATH + path, s.measure);
+    //     String path = "/valves/" + sensorToValveMap[valveIndex][1] + "/moisture";
+    //     Firebase.setInt(C_PATH + path, s.measure);
 
-        path = "/valves/" + sensorToValveMap[valveIndex][1] + "/status";
-        if (valveStatus[valveIndex] != prevValveStatus[valveIndex]) 
-            Firebase.setInt(C_PATH + path, valveStatus[valveIndex]);
+    //     path = "/valves/" + sensorToValveMap[valveIndex][1] + "/status";
+    //     if (valveStatus[valveIndex] != prevValveStatus[valveIndex]) 
+    //         Firebase.setInt(C_PATH + path, valveStatus[valveIndex]);
+
+    //     if (Firebase.failed())
+    //     {
+    //         Serial.println("Error uploading data");
+    //         return;
+    //     }
+    //     prevValveStatus[valveIndex] = valveStatus[valveIndex]; 
+    //     delay(100);
+    // }
+    // waterMeasures = "";
+
+    for (int i = 0; i < 3; i++)
+    {
+        // int valveIndex = getIndexForID(s.id);
+        
+        String path = "/valves/" + sensorToValveMap[i][1] + "/moisture";
+        Firebase.setInt(C_PATH + path, sensorMeasures[i]);
+
+        path = "/valves/" + sensorToValveMap[i][1] + "/status";
+        if (valveStatus[i] != prevValveStatus[i]) 
+            Firebase.setInt(C_PATH + path, valveStatus[i]);
 
         if (Firebase.failed())
         {
             Serial.println("Error uploading data");
             return;
         }
-        prevValveStatus[valveIndex] = valveStatus[valveIndex]; 
+        prevValveStatus[i] = valveStatus[i]; 
         delay(100);
     }
-    waterMeasures = "";
 
+    if(pumpState != prevPumpState) {
+        String p = "/pump";
+        Firebase.setInt(C_PATH + p, pumpState);
+        prevPumpState = pumpState;
+    }
+
+    if (Firebase.failed())
+        {
+            Serial.println("Error uploading data");
+            return;
+        }
+    
     setupAccessPoint();
 }
 
@@ -170,9 +230,11 @@ bool isPushRequired()
 {
     if (millis() - lastPushTime > 60000)
     {
-        if (waterMeasures != "")
+        // if (waterMeasures != "")
+        if (sensorMoistureChanged)
         {
             lastPushTime = millis();
+            sensorMoistureChanged = false;
             return true;
         }
     }
@@ -181,41 +243,41 @@ bool isPushRequired()
 
 int lastSeparatorIndex = 0;
 
-bool getNextMeasure()
-{
-    int strIndex[2] = {0, -1};
-    int splitIndex = 0;
-    int maxIndex = waterMeasures.length() - 1;
-    char separator = ',';
+// bool getNextMeasure()
+// {
+//     int strIndex[2] = {0, -1};
+//     int splitIndex = 0;
+//     int maxIndex = waterMeasures.length() - 1;
+//     char separator = ',';
 
-    if (lastSeparatorIndex == maxIndex)
-    {
-        lastSeparatorIndex = 0;
-        return false;
-    }
+//     if (lastSeparatorIndex == maxIndex)
+//     {
+//         lastSeparatorIndex = 0;
+//         return false;
+//     }
 
-    if (lastSeparatorIndex != 0)
-        lastSeparatorIndex++;
+//     if (lastSeparatorIndex != 0)
+//         lastSeparatorIndex++;
 
-    char c;
-    for (int i = lastSeparatorIndex; i <= maxIndex; i++)
-    {
-        c = waterMeasures.charAt(i);
-        if (c == separator)
-        {
-            strIndex[0] = lastSeparatorIndex;
-            strIndex[1] = i - 1;
-            lastSeparatorIndex = i;
-            break;
-        }
-        if (c == ':')
-            splitIndex = i;
-    }
-
-    s.id = waterMeasures.substring(strIndex[0], splitIndex);
-    s.measure = getShort(waterMeasures.substring(splitIndex + 1, strIndex[1] + 1));
-    return true;
-}
+//     char c;
+//     for (int i = lastSeparatorIndex; i <= maxIndex; i++)
+//     {
+//         c = waterMeasures.charAt(i);
+//         if (c == separator)
+//         {
+//             strIndex[0] = lastSeparatorIndex;
+//             strIndex[1] = i - 1;
+//             lastSeparatorIndex = i;
+//             break;
+//         }
+//         if (c == ':')
+//             splitIndex = i;
+//     }
+//     // sensor id is used for later use dont change to valve id
+//     s.id = waterMeasures.substring(strIndex[0], splitIndex);
+//     s.measure = getShort(waterMeasures.substring(splitIndex + 1, strIndex[1] + 1));
+//     return true;
+// }
 
 short getShort(String s)
 {
@@ -247,14 +309,14 @@ bool isADayPassed()
     return false;
 }
 
-void resetMoistureToMaintain()
+void resetRequiredMoisture()
 {
     setupStationMode();
     beginFirebase();
 
-    String loc = "/moisture_to_maintain";
-    moistureToMaintain = Firebase.getInt(C_PATH + loc);
-    Serial.println(moistureToMaintain);
+    String loc = "/req_moisture";
+    requiredMoisture = Firebase.getInt(C_PATH + loc);
+    Serial.println(requiredMoisture);
     setupAccessPoint();
 }
 
@@ -266,5 +328,5 @@ void loop()
         pushMeasures();
 
     if (isADayPassed())
-        resetMoistureToMaintain();
+        resetRequiredMoisture();
 }
