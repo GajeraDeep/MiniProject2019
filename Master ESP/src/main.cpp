@@ -1,332 +1,319 @@
-#include <FirebaseArduino.h>
+#include "FirebaseESP8266.h"
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include <ArduinoJson.h>
 
-#define WIFI_SSID "Gajera's"
-#define WIFI_PASS "Gajera@037"
-
-#define SOFT_SSID "master"
-#define SOFT_PASS "master123"
-
+#define STA_SSID "Gajera's"
+#define STA_PASS "Gajera@037"
+#define AP_SSID "master"
+#define AP_PASS "master123"
 #define SECRET "SdLwnMZTXgsbXlvJTiv4jvcDIQOZuA7KQ8TOOlZ8"
 #define HOST "mini-project-2-9b3c3.firebaseio.com"
+#define rootPath "/controllers/Ln6zD6LbMOPGzSVzq2j"
+#define pl(x) Serial.print(x)
+#define pln(x) Serial.println(x);
 
-const char *C_PATH = "/controllers/Ln6zD6LbMOPGzSVzq2j";
-
+WiFiClientSecure client;
 ESP8266WebServer server(80);
 
-String waterMeasures = "";
-long lastPushTime = 0;
-int requiredMoisture = 0;
+int port = 443;
+const char *host = "www.darksky.net";
+const char fingerprint[] PROGMEM = "EA C3 0B 36 E8 23 4D 15 12 31 9B CE 08 51 27 AE C1 1D 67 2B";
 
-String sensorToValveMap[3][2] = {
-    {"sensor1", "v1"},
-    {"sensor2", "v2"},
-    {"sensor3", "v3"}};
+FirebaseData firebaseData;
 
-int valveStatus[3] = {0,0,0};
-int prevValveStatus[3] = {0,0,0};
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org"); //, 330000);
 
-int sensorMeasures[3];
-bool sensorMoistureChanged = false;
+int moistureValues[3];
+int valveMapping[3];
+int requiredMoisture;
+long lastPushTime;
+bool valvesState[3];
+bool isPumpOn = false;
+bool isNewDataAvail = false;
+bool valvesState_PreValues[3];
+bool isPumpOn_PreValue = false;
+long rainPossiRecordedTime = 0;
+float rainProbability = 0;
+bool waitingForRain[3];
 
-int pumpState = 0;
-int prevPumpState = 0; // pump state before last push 
-
-// struct Sensor
-// {
-//     String id;
-//     short measure;
-// } s;
-
-void setupAccessPoint();
-void setupServer();
-void handleRequest();
-void setupStationMode();
-void beginFirebase();
-void pushMeasures();
-bool isPushRequired();
-bool getNextMeasure();
-short getShort(String s);
-void resetRequiredMoisture();
-void resetPumpState();
-
-
-void setup()
+float getProbabilityOfRain()
 {
-    Serial.begin(9600);
-    pinMode(LED_BUILTIN, OUTPUT);
-    WiFi.mode(WIFI_AP_STA);
-    lastPushTime = millis();
-    resetRequiredMoisture();
-}
+    int hours = 2;
 
-void setupAccessPoint()
-{
-    Serial.println("Setting AP");
-    WiFi.disconnect();
+    const size_t capacity1 = JSON_OBJECT_SIZE(5) + JSON_OBJECT_SIZE(18) + 310;
+    StaticJsonDocument<capacity1> doc;
 
-    Serial.println("Starting AP as " + String(SOFT_SSID));
-    WiFi.softAP(SOFT_SSID, SOFT_PASS);
-
-    IPAddress myIP = WiFi.softAPIP();
-    Serial.print("AP IP address is :");
-    Serial.print(myIP);
-
-    setupServer();
-}
-
-void setupServer()
-{
-    Serial.println("\nStarting server");
-    server.on("/", handleRequest);
-    server.begin();
-}
-
-void setupStationMode()
-{
-    Serial.println("Setting Station mode");
-    WiFi.disconnect();
-
-    WiFi.hostname("ESP8266 Dev");
-    IPAddress staticIP(192, 168, 1, 90);
-    IPAddress gateway(192, 168, 1, 1);
-    IPAddress subnet(255, 255, 255, 0);
-    IPAddress dns(192, 168, 1, 1);
-
-    WiFi.config(staticIP, gateway, subnet, dns);
-
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    while (WiFi.status() != WL_CONNECTED)
+    if (client.connect(host, port))
     {
-        Serial.print(".");
-        delay(500);
+        long timestamp = timeClient.getEpochTime() + 3600000 * hours;
+        client.print(String("GET ") + "/forecast/9a41ed7b8a1a89491606776763204cb3/23.0395302,72.6742452," + timestamp + "?exclude=minutely,hourly,daily,alerts,flags" + " HTTP/1.1\r\n" +
+                     "Host: api.darksky.net" + "\r\n" +
+                     "Connection: close\r\n\r\n");
+        while (client.connected() || client.available())
+        {
+            if (client.available())
+            {
+                String line = client.readString();
+                String jsonData = line.substring(line.indexOf('{'));
+                deserializeJson(doc, jsonData);
+                JsonObject currently = doc["currently"];
+                rainPossiRecordedTime = millis();
+                rainProbability = (float)currently["precipProbability"];
+
+                return rainProbability;
+            }
+        }
+        client.stop();
+        return -1;
     }
-    Serial.println();
-    Serial.print("Connected with IP: ");
-    Serial.println(WiFi.localIP());
+    else
+    {
+        pln("Failed to connect to DarkNet API");
+    }
+
+    return 0;
 }
 
-int getIndexForID(String sid)
+bool waitForRain(int sensor)
+{
+    if (waitingForRain[sensor])
+        return true;
+    if (millis() - rainPossiRecordedTime < 3600000 * 2)
+    {
+        waitingForRain[sensor] = true;
+    }
+    return false;
+}
+
+void updateFirebaseValue(String relativePath, String key, int value)
+{
+    FirebaseJson updateData;
+    updateData.addInt(key, value);
+    String path = rootPath + relativePath;
+    if (!Firebase.updateNodeSilent(firebaseData, path, updateData))
+    {
+        pln("Upload Failed");
+        pln(firebaseData.errorReason());
+    }
+}
+
+void pushNewData()
 {
     for (int i = 0; i < 3; i++)
     {
-        if (sid.equalsIgnoreCase(sensorToValveMap[i][0]))
+        String path = String("/moistureMeasures/v") + String(valveMapping[i] + 1);
+        String key = String("sensor") + String(i + 1);
+        pl(path);
+        pl(" ");
+        pln(key);
+        updateFirebaseValue(path, key, moistureValues[i]);
+    }
+
+    for (int i = 0; i < 3; i++)
+    {
+        if (valvesState[i] != valvesState_PreValues[i])
+            updateFirebaseValue("/valvesState", String("v") + String(i + 1), valvesState[i] ? 1 : 0);
+        valvesState_PreValues[i] = valvesState[i];
+    }
+
+    if (isPumpOn != isPumpOn_PreValue)
+        updateFirebaseValue("", "pump", isPumpOn ? 1 : 0);
+    isPumpOn_PreValue = isPumpOn;
+
+    isNewDataAvail = false;
+}
+
+void streamCallback(StreamData data)
+{
+    pln("Stream Data...");
+    pln(data.streamPath());
+    pln(data.dataPath());
+    pln(data.dataType());
+}
+
+void streamTimeoutCallback(bool timeout)
+{
+}
+
+void setValveMapping()
+{
+    const size_t capacity = 3 * JSON_OBJECT_SIZE(1) + JSON_OBJECT_SIZE(3) + 40;
+    DynamicJsonDocument doc(capacity);
+
+    if (Firebase.getJSON(firebaseData, rootPath + String("/moistureMeasures")))
+    {
+        deserializeJson(doc, firebaseData.jsonData());
+        JsonObject obj = doc.as<JsonObject>();
+        for (JsonPair jp : obj)
         {
-            return i;
+            for (JsonPair sjp : jp.value().as<JsonObject>())
+            {
+                int key = String(sjp.key().c_str()).charAt(6) - '0' - 1;
+                int value = String(jp.key().c_str()).charAt(1) - '0' - 1;
+                pl(key);
+                pl(" ");
+                pln(value);
+                valveMapping[key] = value;
+            }
         }
     }
-    return -1;
+}
+
+void resetPumpState()
+{
+    for (int i = 0; i < 3; i++)
+    {
+        if (valvesState[i] && !isPumpOn)
+        {
+            pln("Pump is on");
+            isPumpOn = true;
+            return;
+        }
+    }
+
+    if (isPumpOn)
+        pln("Pump is off");
+    isPumpOn = false;
 }
 
 void handleRequest()
 {
-    digitalWrite(LED_BUILTIN, LOW);
-
-    int index = getIndexForID(server.arg("id"));
-    if (index == -1)
+    if (!server.hasArg("plain"))
     {
-        server.send(200, "text/http", "Invalid sensor id");
+        server.send(200, "text/plain", "No data received");
         return;
     }
 
-    short m = getShort(server.arg("m"));
-    if (m != sensorMeasures[index]) {
-        if (m < requiredMoisture - 5 && valveStatus[index] == 0)
-        {
-            Serial.println("Set valve " + sensorToValveMap[index][1] + " to on");
-            valveStatus[index] = 1;
-        }
-        else if (valveStatus[index] == 1 && m >= requiredMoisture + 5)
-        {
-            Serial.println("Set valve " + sensorToValveMap[index][1] + " to off");
-            valveStatus[index] = 0;
-        }
-        sensorMoistureChanged = true;
-    }
+    server.send(200, "text/plain", "recorded");
+    String jsonData = server.arg("plain");
 
-    sensorMeasures[index] = getShort(server.arg("m"));
-    resetPumpState();
+    const size_t size = JSON_OBJECT_SIZE(1) + 20;
+    StaticJsonDocument<size> doc;
+    deserializeJson(doc, jsonData);
 
-    //waterMeasures += server.arg("id") + ":" + server.arg("m") + ",";
-    server.send(200, "text/http", "recorded");
+    JsonObject docObj = doc.as<JsonObject>();
 
-    digitalWrite(LED_BUILTIN, HIGH);
-}
-
-void resetPumpState() {
-    for (int i = 0; i < 3; i++)
+    for (JsonPair jp : docObj)
     {
-        if(valveStatus[i] == 1) {
-            pumpState = 1;
+        isNewDataAvail = true;
+
+        int index = String(jp.key().c_str()).toInt() - 1;
+        int value = jp.value().as<int>();
+        moistureValues[index] = value;
+
+        pl("New Entry: ");
+        pl(index);
+        pl(" ");
+        pln(value);
+
+        int valveNo = valveMapping[index];
+
+        if (value < requiredMoisture && !valvesState[valveNo])
+        {
+            valvesState[valveNo] = true;
+        }
+        else if (value >= requiredMoisture && valvesState[valveNo])
+        {
+            valvesState[valveNo] = false;
+        }
+        else
+        {
             return;
         }
+        pl("Valve ");
+        pl(index);
+        pl(" is set to ");
+        pln(valvesState[valveNo]);
+        resetPumpState();
     }
-    pumpState = 0;
 }
 
-void pushMeasures()
+void fetchRequiredMoisture()
 {
-    beginFirebase();
-    setupStationMode();
-
-    // while (getNextMeasure())
-    // {
-    //     int valveIndex = getIndexForID(s.id);
-        
-    //     String path = "/valves/" + sensorToValveMap[valveIndex][1] + "/moisture";
-    //     Firebase.setInt(C_PATH + path, s.measure);
-
-    //     path = "/valves/" + sensorToValveMap[valveIndex][1] + "/status";
-    //     if (valveStatus[valveIndex] != prevValveStatus[valveIndex]) 
-    //         Firebase.setInt(C_PATH + path, valveStatus[valveIndex]);
-
-    //     if (Firebase.failed())
-    //     {
-    //         Serial.println("Error uploading data");
-    //         return;
-    //     }
-    //     prevValveStatus[valveIndex] = valveStatus[valveIndex]; 
-    //     delay(100);
-    // }
-    // waterMeasures = "";
-
-    for (int i = 0; i < 3; i++)
+    if (Firebase.getInt(firebaseData, rootPath + String("/req_moisture")))
     {
-        // int valveIndex = getIndexForID(s.id);
-        
-        String path = "/valves/" + sensorToValveMap[i][1] + "/moisture";
-        Firebase.setInt(C_PATH + path, sensorMeasures[i]);
-
-        path = "/valves/" + sensorToValveMap[i][1] + "/status";
-        if (valveStatus[i] != prevValveStatus[i]) 
-            Firebase.setInt(C_PATH + path, valveStatus[i]);
-
-        if (Firebase.failed())
-        {
-            Serial.println("Error uploading data");
-            return;
-        }
-        prevValveStatus[i] = valveStatus[i]; 
-        delay(100);
+        requiredMoisture = firebaseData.intData();
+        pl("Moisture; ");
+        pln(requiredMoisture);
     }
-
-    if(pumpState != prevPumpState) {
-        String p = "/pump";
-        Firebase.setInt(C_PATH + p, pumpState);
-        prevPumpState = pumpState;
+    else
+    {
+        pln("Req. Moisture request failed");
+        pln(firebaseData.errorReason());
     }
-
-    if (Firebase.failed())
-        {
-            Serial.println("Error uploading data");
-            return;
-        }
-    
-    setupAccessPoint();
 }
 
 bool isPushRequired()
 {
     if (millis() - lastPushTime > 60000)
     {
-        // if (waterMeasures != "")
-        if (sensorMoistureChanged)
+        if (isNewDataAvail)
         {
             lastPushTime = millis();
-            sensorMoistureChanged = false;
+            isNewDataAvail = false;
             return true;
         }
     }
     return false;
 }
 
-int lastSeparatorIndex = 0;
-
-// bool getNextMeasure()
-// {
-//     int strIndex[2] = {0, -1};
-//     int splitIndex = 0;
-//     int maxIndex = waterMeasures.length() - 1;
-//     char separator = ',';
-
-//     if (lastSeparatorIndex == maxIndex)
-//     {
-//         lastSeparatorIndex = 0;
-//         return false;
-//     }
-
-//     if (lastSeparatorIndex != 0)
-//         lastSeparatorIndex++;
-
-//     char c;
-//     for (int i = lastSeparatorIndex; i <= maxIndex; i++)
-//     {
-//         c = waterMeasures.charAt(i);
-//         if (c == separator)
-//         {
-//             strIndex[0] = lastSeparatorIndex;
-//             strIndex[1] = i - 1;
-//             lastSeparatorIndex = i;
-//             break;
-//         }
-//         if (c == ':')
-//             splitIndex = i;
-//     }
-//     // sensor id is used for later use dont change to valve id
-//     s.id = waterMeasures.substring(strIndex[0], splitIndex);
-//     s.measure = getShort(waterMeasures.substring(splitIndex + 1, strIndex[1] + 1));
-//     return true;
-// }
-
-short getShort(String s)
+void setup()
 {
-    short no = 0;
-    for (unsigned int i = 0; i < s.length(); i++)
+    Serial.begin(9600);
+    WiFi.mode(WIFI_AP_STA);
+
+    pln("Setting AP");
+    String res = WiFi.softAP(AP_SSID, AP_PASS) ? "Ready" : "Failed";
+    pln(res);
+
+    pln("Connecting to wifi");
+    WiFi.begin(STA_SSID, STA_PASS);
+
+    while (WiFi.status() != WL_CONNECTED)
     {
-        no = no * 10 + s.charAt(i) - '0';
+        pl(".");
+        delay(500);
     }
-    return no;
-}
 
-void beginFirebase()
-{
+    pln("\nConnected with IP: ");
+    pln(WiFi.localIP());
+
+    client.setFingerprint(fingerprint);
+    client.setTimeout(15000);
+    delay(1000);
+
+    lastPushTime = millis();
+
+    timeClient.begin();
+    timeClient.update();
+
     Firebase.begin(HOST, SECRET);
-    Firebase.stream(C_PATH);
+    Firebase.setStreamCallback(firebaseData, streamCallback, streamTimeoutCallback);
 
-    if (Firebase.success())
-        Serial.println("Success");
-}
+    // if (!Firebase.beginStream(firebaseData, "/controllers/Ln6zD6LbMOPGzSVzq2j"))
+    // {
+    // 	pln(firebaseData.errorReason());
+    // }
 
-long lastResetTime = 0;
-bool isADayPassed()
-{
-    if (millis() - lastResetTime > 60000 * 60 * 24)
-    {
-        lastResetTime = millis();
-        return true;
-    }
-    return false;
-}
+    pln("Setting mapping");
+    setValveMapping();
+    fetchRequiredMoisture();
 
-void resetRequiredMoisture()
-{
-    setupStationMode();
-    beginFirebase();
-
-    String loc = "/req_moisture";
-    requiredMoisture = Firebase.getInt(C_PATH + loc);
-    Serial.println(requiredMoisture);
-    setupAccessPoint();
+    server.on("/values", handleRequest);
+    server.begin();
 }
 
 void loop()
 {
-    server.handleClient();
-
     if (isPushRequired())
-        pushMeasures();
+    {
+        pushNewData();
+    }
 
-    if (isADayPassed())
-        resetRequiredMoisture();
+    server.handleClient();
 }
